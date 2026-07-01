@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/cervais/.github/blob/main/SECURITY.md
+    about: Please report security vulnerabilities privately rather than in a public issue.
+  - name: Sales / general inquiries
+    url: https://cervais.com/contact/
+    about: For product demos, sales, or general questions, contact us directly.
