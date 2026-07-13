@@ -139,6 +139,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      checks: read
+      actions: read
     steps:
       # CI-first: never spend model tokens on a red PR.
       - name: Wait for the rest of CI to be green
@@ -203,6 +205,8 @@ jobs:
     timeout-minutes: 50
     permissions:
       contents: read
+      checks: read
+      actions: read
     env:
       LANE: ${{ needs.classify.outputs.lane }}
       LANE_REASON: ${{ needs.classify.outputs.reason }}
