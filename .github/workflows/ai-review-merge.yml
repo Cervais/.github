@@ -96,12 +96,8 @@ jobs:
             exit 0
           fi
 
-          # Fast lane A: deletions-only.
-          if jq -e 'all(.[]; .additions == 0)' <<<"$files" >/dev/null; then
-            out lane fast; out reason "deletions-only diff"; out model none
-            exit 0
-          fi
-          # Fast lane B: docs-only.
+          # Fast lane B: docs-only. (No deletions-only lane: removing code
+          # can remove a security control, so deletions get full review.)
           if jq -e '[.[].filename] | all(test("(^docs/|\\.(md|txt)$)"))' <<<"$files" >/dev/null; then
             out lane fast; out reason "docs-only diff"; out model none
             exit 0
@@ -220,6 +216,7 @@ jobs:
     env:
       LANE: ${{ needs.classify.outputs.lane }}
       LANE_REASON: ${{ needs.classify.outputs.reason }}
+      REVIEWED_SHA: ${{ needs.classify.outputs.head_sha }}
     steps:
       - name: Wait for green CI, then squash-merge
         env:
@@ -255,7 +252,12 @@ jobs:
                 gh pr comment "$PR_NUMBER" --repo "$REPO" \
                   --body "🤖 Fast-lane merge (no AI review needed): ${LANE_REASON}. CI green; squash-merging."
               fi
-              gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --admin --delete-branch
+              head_now=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+              if [ "$head_now" != "$REVIEWED_SHA" ]; then
+                echo "Head moved since review ($REVIEWED_SHA -> $head_now); not merging. Apply re-review."
+                exit 1
+              fi
+              gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --admin --delete-branch --match-head-commit "$REVIEWED_SHA"
               exit 0
             fi
             echo "waiting on $PENDING check(s)…"; sleep 30
