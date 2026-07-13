@@ -141,6 +141,7 @@ jobs:
       pull-requests: write
       checks: read
       actions: read
+      statuses: read
     steps:
       # CI-first: never spend model tokens on a red PR.
       - name: Wait for the rest of CI to be green
@@ -215,6 +216,7 @@ jobs:
       contents: read
       checks: read
       actions: read
+      statuses: read
     env:
       LANE: ${{ needs.classify.outputs.lane }}
       LANE_REASON: ${{ needs.classify.outputs.reason }}
