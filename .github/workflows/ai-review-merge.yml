@@ -6,13 +6,15 @@ name: AI review + auto-merge (reusable)
 #
 # Cost-lane design:
 #   1. `classify` (free, deterministic bash) routes the PR into a lane:
-#      - fast: deletions-only or docs-only diffs, and Renovate/Dependabot
-#        non-major updates (bot-authored, manifest/lockfile-only diff).
-#        No model is invoked.
+#      - fast: documentation/community-health-only diffs, and Renovate/
+#        Dependabot non-major updates (bot-authored, manifest/lockfile-only
+#        diff). No model is invoked.
 #      - ai: everything else gets a Claude review — but only AFTER the rest of
 #        CI is green, so red PRs cost $0.
-#   2. Model tiering: routine PRs are reviewed by Haiku; PRs touching sensitive
-#      paths (workflows, auth, payments, secrets, policies) get Sonnet.
+#   2. Model tiering + spend cap: routine PRs are reviewed by Haiku; PRs
+#      touching sensitive paths (workflows, auth, payments, secrets, policies)
+#      get Sonnet. Each tier carries a per-review `--max-budget-usd` cap
+#      (0.15 / 0.50) paired with a turn cap, bounding the spend of any one run.
 #   3. Reviews run once per ready PR, not per push. Re-run with the `re-review`
 #      label (auto-removed).
 #   Either lane merges only on green CI (squash + branch delete) using the org
@@ -78,6 +80,7 @@ jobs:
       lane: ${{ steps.classify.outputs.lane }}
       reason: ${{ steps.classify.outputs.reason }}
       model: ${{ steps.classify.outputs.model }}
+      budget_usd: ${{ steps.classify.outputs.budget_usd }}
       head_sha: ${{ steps.classify.outputs.head_sha }}
     steps:
       - name: Classify
@@ -96,13 +99,16 @@ jobs:
           nfiles=$(jq length <<<"$files")
           if [ "$nfiles" -eq 0 ]; then
             out lane ai; out reason "empty diff — needs a look"; out model claude-haiku-4-5
+            out budget_usd 0.15
             exit 0
           fi
 
-          # Fast lane B: docs-only. (No deletions-only lane: removing code
-          # can remove a security control, so deletions get full review.)
-          if jq -e '[.[].filename] | all(test("(^docs/|\\.(md|txt)$)"))' <<<"$files" >/dev/null; then
-            out lane fast; out reason "docs-only diff"; out model none
+          # Fast lane B: documentation / community-health only. A precise
+          # allowlist (not a repo-wide *.md match, which would fast-lane any
+          # Markdown anywhere — e.g. a templated doc under src/). Removing code
+          # can strip a security control, so deletions still get full review.
+          if jq -e '[.[].filename] | all(test("(^|/)(docs/.*|README(\\.[^/]*)?|CHANGELOG(\\.[^/]*)?|CONTRIBUTING(\\.[^/]*)?|CODE_OF_CONDUCT(\\.[^/]*)?|SECURITY(\\.[^/]*)?|SUPPORT(\\.[^/]*)?|LICENSE(\\.[^/]*)?|\\.github/(ISSUE_TEMPLATE/.*|PULL_REQUEST_TEMPLATE\\.md|FUNDING\\.yml))$"; "i"))' <<<"$files" >/dev/null; then
+            out lane fast; out reason "documentation/community-health-only change ($nfiles file(s)); CI must still pass"; out model none
             exit 0
           fi
           # Fast lane C: bot non-major dependency update — bot-authored,
@@ -120,11 +126,15 @@ jobs:
             fi
           fi
 
-          # AI lane — tier by sensitivity of touched paths.
+          # AI lane — tier by sensitivity of touched paths. Each tier carries a
+          # per-review spend cap (paired with a turn cap on the action) so a
+          # runaway review cannot burn unbounded API budget.
           if jq -e '[.[].filename] | any(test("(^|/)\\.github/|abac|(^|/|[._-])auth|polic|payment|ledger|webhook|secret|middleware|rbac|rls|crypto|key"; "i"))' <<<"$files" >/dev/null; then
             out model claude-sonnet-5
+            out budget_usd 0.50
           else
             out model claude-haiku-4-5
+            out budget_usd 0.15
           fi
           out lane ai; out reason "code diff — AI review"
 
@@ -181,7 +191,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.TOKEN }}
           allowed_bots: 'renovate,renovate[bot],dependabot,dependabot[bot]'
-          claude_args: "--model ${{ needs.classify.outputs.model }} --max-turns 60 --allowedTools Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr review:*),Read,Grep,Glob"
+          claude_args: "--model ${{ needs.classify.outputs.model }} --max-turns 24 --max-budget-usd ${{ needs.classify.outputs.budget_usd }} --allowedTools Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr review:*),Bash(gh pr comment:*),Read,Grep,Glob"
           prompt: |
             You are the autonomous merge gate for ${{ github.repository }}.
             Review PR #${{ env.PR_NUMBER }} (use `gh pr view`/`gh pr diff` for
@@ -195,11 +205,17 @@ jobs:
             Style-only nits are not blocking; mention at most briefly.
             ${{ inputs.review_prompt_extra }}
 
-            Then submit exactly ONE PR review:
+            Then submit exactly ONE PR review. If GitHub rejects it with
+            "Can not approve your own pull request" (the gate token authored
+            the PR), fall back to an equivalent `gh pr comment` so there is an
+            auditable record — the required check and the merge job remain the
+            real enforcement mechanism either way:
               - No blocking findings:
-                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --approve --body "<short summary of what was checked>"
+                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --approve --body "<short summary of what was checked>" \
+                  || gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body "✅ Merge gate — approved: <short summary of what was checked>"
               - Blocking findings:
-                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --request-changes --body "<the concrete findings>"
+                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --request-changes --body "<the concrete findings>" \
+                  || gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body "🚫 Merge gate — blocked: <the concrete findings>"
                 and then exit non-zero (`exit 1`) so the merge job cannot run.
 
   merge:
