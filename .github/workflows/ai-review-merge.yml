@@ -24,7 +24,10 @@ name: AI review + auto-merge (reusable)
 #   name: AI review + auto-merge
 #   on:
 #     pull_request:
-#       types: [opened, reopened, ready_for_review, labeled]
+#       types: [opened, reopened, ready_for_review, synchronize, labeled]
+#   # `synchronize` keeps the gate fresh when a bot rebases; cost stays bounded
+#   # because fast lanes invoke no model and the AI lane waits for green CI.
+#   # Drop it for human-push-heavy repos that prefer the `re-review` label.
 #   jobs:
 #     gate:
 #       uses: Cervais/.github/.github/workflows/ai-review-merge.yml@main
@@ -109,11 +112,10 @@ jobs:
             commit_ok=$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --paginate \
               --jq '.[] | (.author.login // "MISSING")' \
               | jq -Rs 'split("\n") | map(select(length > 0)) | all(test("^(renovate|dependabot)(\\[bot\\])?$"))')
-            manifest_only=$(jq '[.[].filename] | all(test("(^|/)(package\\.json|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock|Cargo\\.(toml|lock)|go\\.(mod|sum)|pyproject\\.toml|poetry\\.lock|uv\\.lock)$"))' <<<"$files")
             nonmajor=$(jq '.labels | map(.name) | any(test("^(update/(patch|minor|pin|digest|pinDigest|lockFileMaintenance)|dependencies)$"))' <<<"$meta")
-            if [ "$commit_ok" = true ] && [ "$manifest_only" = true ] && [ "$nonmajor" = true ]; then
+            if [ "$commit_ok" = true ] && [ "$nonmajor" = true ]; then
               out lane fast; out model none
-              out reason "bot non-major dependency update: bot-authored commits only, manifest/lockfile-only diff"
+              out reason "bot non-major dependency update: bot-authored commits only, non-major update label"
               exit 0
             fi
           fi
@@ -154,6 +156,7 @@ jobs:
             all=$(jq -n --argjson a "$checks" --argjson b "$statuses" '$a + $b')
             FAILED=$(jq '[.[] | select(.conclusion | ascii_upcase | IN("FAILURE","CANCELLED","TIMED_OUT","ACTION_REQUIRED","ERROR"))] | length' <<<"$all")
             PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$all")
+            PENDING_NAMES=$(jq -r '[.[] | select(.status != "completed") | .name] | join(", ")' <<<"$all")
             FAILED_NAMES=$(jq -r '.[] | select(.conclusion | ascii_upcase | IN("FAILURE","CANCELLED","TIMED_OUT","ACTION_REQUIRED","ERROR")) | .name' <<<"$all")
           }
           for i in $(seq 1 60); do
@@ -162,7 +165,7 @@ jobs:
               echo "CI is red on PR #$PR_NUMBER — not reviewing."; echo "$FAILED_NAMES"; exit 1
             fi
             [ "$PENDING" -eq 0 ] && exit 0
-            echo "waiting on $PENDING check(s)…"; sleep 30
+            echo "waiting on: $PENDING_NAMES"; sleep 30
           done
           echo "Timed out waiting for CI; not reviewing."; exit 1
 
@@ -178,7 +181,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.TOKEN }}
           allowed_bots: 'renovate,renovate[bot],dependabot,dependabot[bot]'
-          claude_args: "--model ${{ needs.classify.outputs.model }} --max-turns 12 --allowedTools Bash,Read,Grep,Glob"
+          claude_args: "--model ${{ needs.classify.outputs.model }} --max-turns 60 --allowedTools Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr review:*),Read,Grep,Glob"
           prompt: |
             You are the autonomous merge gate for ${{ github.repository }}.
             Review PR #${{ env.PR_NUMBER }} (use `gh pr view`/`gh pr diff` for
@@ -240,6 +243,7 @@ jobs:
             all=$(jq -n --argjson a "$checks" --argjson b "$statuses" '$a + $b')
             FAILED=$(jq '[.[] | select(.conclusion | ascii_upcase | IN("FAILURE","CANCELLED","TIMED_OUT","ACTION_REQUIRED","ERROR"))] | length' <<<"$all")
             PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$all")
+            PENDING_NAMES=$(jq -r '[.[] | select(.status != "completed") | .name] | join(", ")' <<<"$all")
             FAILED_NAMES=$(jq -r '.[] | select(.conclusion | ascii_upcase | IN("FAILURE","CANCELLED","TIMED_OUT","ACTION_REQUIRED","ERROR")) | .name' <<<"$all")
           }
           for i in $(seq 1 80); do
@@ -260,6 +264,6 @@ jobs:
               gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --admin --delete-branch --match-head-commit "$REVIEWED_SHA"
               exit 0
             fi
-            echo "waiting on $PENDING check(s)…"; sleep 30
+            echo "waiting on: $PENDING_NAMES"; sleep 30
           done
           echo "Timed out waiting for CI on PR #$PR_NUMBER."; exit 1
