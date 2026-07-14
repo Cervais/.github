@@ -205,18 +205,52 @@ jobs:
             Style-only nits are not blocking; mention at most briefly.
             ${{ inputs.review_prompt_extra }}
 
-            Then submit exactly ONE PR review. If GitHub rejects it with
-            "Can not approve your own pull request" (the gate token authored
-            the PR), fall back to an equivalent `gh pr comment` so there is an
-            auditable record — the required check and the merge job remain the
-            real enforcement mechanism either way:
-              - No blocking findings:
-                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --approve --body "<short summary of what was checked>" \
-                  || gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body "✅ Merge gate — approved: <short summary of what was checked>"
-              - Blocking findings:
-                gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --request-changes --body "<the concrete findings>" \
-                  || gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body "🚫 Merge gate — blocked: <the concrete findings>"
-                and then exit non-zero (`exit 1`) so the merge job cannot run.
+            Compose the review body as LITERAL text and pass it via a quoted
+            heredoc to `--body-file -` — never interpolate findings into a
+            double-quoted argument, because the summary and diff may contain
+            backticks, quotes, or `$(...)` that the shell would otherwise
+            execute. Submit exactly ONE PR review. If the review command fails
+            because GitHub forbids reviewing your own PR (the gate token
+            authored it), fall back to the matching marked comment so there is
+            an auditable record — the required check and the merge job remain
+            the real enforcement mechanism either way:
+              - No blocking findings — approve:
+                  gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --approve --body-file - <<'EOF'
+                  <short summary of what was checked>
+                  EOF
+                On a self-review rejection, run instead:
+                  gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body-file - <<'EOF'
+                  ✅ Merge gate — approved: <short summary of what was checked>
+                  EOF
+              - Blocking findings — request changes:
+                  gh pr review ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --request-changes --body-file - <<'EOF'
+                  <the concrete findings>
+                  EOF
+                On a self-review rejection, run instead:
+                  gh pr comment ${{ env.PR_NUMBER }} --repo ${{ env.REPO }} --body-file - <<'EOF'
+                  🚫 Merge gate — blocked: <the concrete findings>
+                  EOF
+                Then exit non-zero (`exit 1`) so the merge job cannot run.
+
+      - name: Enforce the review verdict (fail closed)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+          # Deterministic backstop to the model's own exit code: block the merge
+          # job if the gate requested changes, or recorded a blocking verdict via
+          # the self-authored fallback comment. Keyed off the LATEST gate comment
+          # so a stale marker from an earlier review round cannot false-block.
+          decision=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json reviewDecision --jq '.reviewDecision // ""')
+          if [ "$decision" = "CHANGES_REQUESTED" ]; then
+            echo "reviewDecision=CHANGES_REQUESTED — blocking merge."; exit 1
+          fi
+          last_verdict=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments \
+            --jq '[.comments[] | select(.body | test("Merge gate — (approved|blocked):"))] | last | .body // ""')
+          if printf '%s' "$last_verdict" | grep -qF "🚫 Merge gate — blocked:"; then
+            echo "Latest gate verdict is a blocking fallback comment — blocking merge."; exit 1
+          fi
+          echo "No blocking verdict; review passed."
 
   merge:
     name: Merge on green
